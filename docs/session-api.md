@@ -220,7 +220,7 @@ One-shot and automated sessions are excluded by default. Use the
 | `--project`           | `project`           | string                            |
 | `--exclude-project`   | `exclude_project`   | string                            |
 | `--machine`           | `machine`           | string                            |
-| `--branch`            | `git_branch`        | string; requires `--project`      |
+| `--branch`            | `git_branch`        | Branch name; requires `--project`. The HTTP param takes an opaque token from `GET /api/v1/branches`, which the flag encodes |
 | `--agent`             | `agent`             | string                            |
 | `--date`              | `date`              | `YYYY-MM-DD`                      |
 | `--date-from`         | `date_from`         | `YYYY-MM-DD`                      |
@@ -564,7 +564,7 @@ default; opt back in with `--include-one-shot`,
 | `--project`           | `project`           | string                                                 |
 | `--exclude-project`   | `exclude_project`   | string                                                 |
 | `--machine`           | `machine`           | string                                                 |
-| `--branch`            | `git_branch`        | string; requires `--project`                           |
+| `--branch`            | `git_branch`        | Branch name; requires `--project`. The HTTP param takes an opaque token from `GET /api/v1/branches`, which the flag encodes |
 | `--agent`             | `agent`             | string                                                 |
 | `--date`              | `date`              | `YYYY-MM-DD`                                           |
 | `--date-from`         | `date_from`         | `YYYY-MM-DD`                                           |
