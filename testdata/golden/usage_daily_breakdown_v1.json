@@ -94,6 +94,17 @@
           "cacheReadTokens": 0,
           "cost": 0.0042
         }
+      ],
+      "branchBreakdowns": [
+        {
+          "project": "unknown-project",
+          "branch": "",
+          "inputTokens": 300,
+          "outputTokens": 60,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "cost": 0.0042
+        }
       ]
     },
     {
@@ -129,6 +140,17 @@
       "agentBreakdowns": [
         {
           "agent": "codex",
+          "inputTokens": 800,
+          "outputTokens": 160,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "cost": 0.00288
+        }
+      ],
+      "branchBreakdowns": [
+        {
+          "project": "remote-project",
+          "branch": "feature/golden",
           "inputTokens": 800,
           "outputTokens": 160,
           "cacheCreationTokens": 0,
@@ -195,6 +217,26 @@
         },
         {
           "agent": "codex",
+          "inputTokens": 1200,
+          "outputTokens": 240,
+          "cacheCreationTokens": 80,
+          "cacheReadTokens": 400,
+          "cost": 0.00476
+        }
+      ],
+      "branchBreakdowns": [
+        {
+          "project": "path-project",
+          "branch": "",
+          "inputTokens": 300,
+          "outputTokens": 60,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 0,
+          "cost": 0.0125
+        },
+        {
+          "project": "remote-project",
+          "branch": "feature/golden",
           "inputTokens": 1200,
           "outputTokens": 240,
           "cacheCreationTokens": 80,
