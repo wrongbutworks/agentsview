@@ -418,7 +418,7 @@ func TestRender(t *testing.T) {
 			},
 		},
 		{
-			name: "corrupted capture exits 2 and is described",
+			name: "corrupted candidate capture exits 2 and is described",
 			r: results{
 				newCount:  1,
 				newSyntax: []string{"test:3: no iteration count"},
@@ -427,6 +427,20 @@ func TestRender(t *testing.T) {
 			wantOut: []string{
 				"candidate capture is corrupted",
 				"no iteration count",
+			},
+		},
+		{
+			name: "corrupted baseline capture warns but passes",
+			r: results{
+				report:    []string{"BenchmarkFoo-8: ok"},
+				newCount:  1,
+				oldSyntax: []string{"base:7: no iteration count"},
+			},
+			wantCode: 0,
+			wantOut: []string{
+				"baseline capture is corrupted",
+				"no iteration count",
+				"no regressions beyond thresholds",
 			},
 		},
 		{

@@ -35,9 +35,13 @@
 //
 // Lines that look like benchmark results but fail to parse (for
 // example test log output interleaved into a result line) are a
-// corrupted capture: they are reported and the gate exits 2, because
-// the corrupted benchmark would otherwise silently vanish from both
-// sides and never gate again.
+// corrupted capture. In the candidate they are reported and the gate
+// exits 2, because the corrupted benchmark would otherwise silently
+// vanish from both sides and never gate again. In the baseline they
+// are only warned about: the baseline run executes merge-base code a
+// PR cannot fix, and a benchmark corrupted there still parses on the
+// candidate side, where it takes the reported missing-baseline
+// not-gated path instead of vanishing.
 package main
 
 import (
@@ -370,10 +374,12 @@ type results struct {
 }
 
 // render formats the human-readable outcome and picks the exit
-// code: 2 for unusable input or configuration errors, 1 for
-// regressions, 0 otherwise. Violations always print, even when a
-// config issue or corrupted capture also occurred, so a detected
-// regression is never hidden behind an exit-2.
+// code: 2 for an unusable candidate capture or configuration errors,
+// 1 for regressions, 0 otherwise. Baseline corruption is reported but
+// not fatal — the merge-base run is not fixable from the PR under
+// review. Violations always print, even when a config issue or
+// corrupted capture also occurred, so a detected regression is never
+// hidden behind an exit-2.
 func render(r results) (string, int) {
 	var b strings.Builder
 	for _, line := range r.report {
@@ -395,7 +401,7 @@ func render(r results) (string, int) {
 		}
 	}
 	switch {
-	case len(r.oldSyntax)+len(r.newSyntax) > 0 || len(r.issues) > 0:
+	case len(r.newSyntax) > 0 || len(r.issues) > 0:
 		return b.String(), 2
 	case r.newCount == 0:
 		fmt.Fprintln(&b, "benchgate: candidate output contains no benchmarks")
@@ -407,10 +413,10 @@ func render(r results) (string, int) {
 	return b.String(), 0
 }
 
-// renderSyntax reports unparseable result lines in one capture. A
-// benchmark whose result line is corrupted (e.g. by interleaved log
-// output) parses on neither side and would otherwise vanish from
-// the gate without a trace.
+// renderSyntax reports unparseable result lines in one capture
+// (e.g. log output interleaved into a result line). Candidate-side
+// corruption is fatal in render; baseline-side corruption only drops
+// the affected benchmark to the missing-baseline not-gated path.
 func renderSyntax(b *strings.Builder, side string, errs []string) {
 	if len(errs) == 0 {
 		return
