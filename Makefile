@@ -12,6 +12,13 @@ LDFLAGS_RELEASE := $(LDFLAGS) -s -w
 DESKTOP_DIST_DIR := dist/desktop
 GOLANGCI_LINT_VERSION ?= v2.11.4
 CUSTOM_GCL := ./custom-gcl
+# Isolate golangci-lint's cache per checkout. Sibling worktrees share the
+# default cache (~/Library/Caches/golangci-lint), and cached suggested-fixes
+# resolve through worktree-relative paths, so `run --fix` can apply byte
+# offsets computed against another checkout's version of a file and corrupt
+# it in place.
+GOLANGCI_LINT_CACHE ?= $(CURDIR)/.golangci-cache
+export GOLANGCI_LINT_CACHE
 PRICING_SNAPSHOT_FILE := internal/pricing/snapshot/litellm_snapshot.json.gz
 
 GOPATH_FIRST := $(shell go env GOPATH | cut -d: -f1)
