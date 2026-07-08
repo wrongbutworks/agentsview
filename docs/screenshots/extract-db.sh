@@ -190,6 +190,30 @@ WITH RECURSIVE screenshot_tree(id) AS (
 INSERT INTO screenshot_sessions(id)
 SELECT id FROM screenshot_tree;
 
+-- Thinking-block screenshots navigate directly to one rich session because
+-- thinking messages are rare and often older than the recent sidebar window.
+-- Keep one non-automated root fixture without letting automated review runs
+-- back into the default sidebar export.
+INSERT OR IGNORE INTO screenshot_sessions(id)
+SELECT s.id
+FROM sessions s
+JOIN screenshot_safe_sessions safe ON safe.id = s.id
+WHERE COALESCE(s.parent_session_id, '') = ''
+  AND s.relationship_type NOT IN ('subagent', 'fork', 'continuation')
+  AND EXISTS (
+    SELECT 1
+    FROM messages m
+    WHERE m.session_id = s.id
+      AND COALESCE(m.thinking_text, '') != ''
+  )
+ORDER BY (
+  SELECT COUNT(*)
+  FROM messages m
+  WHERE m.session_id = s.id
+    AND COALESCE(m.thinking_text, '') != ''
+) DESC, s.id
+LIMIT 1;
+
 -- Drop FTS5 sync triggers before the bulk delete. Each
 -- DELETE FROM messages otherwise fires messages_ad which
 -- runs an FTS5 'delete' command, and that trips

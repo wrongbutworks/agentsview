@@ -189,6 +189,14 @@ func TestExtractDBKeepsOnlyHumanRootTrees(t *testing.T) {
 	insertSession("orphan_subagent_drop", "missing_parent", "subagent", recent, 0, 1, 1)
 	insertSession("orphan_fork_drop", "missing_parent", "fork", recent, 0, 1, 1)
 	insertSession("old_root_drop", "", "", old, 0, 3, 2)
+	insertSession("old_thinking_keep", "", "", old, 0, 3, 2)
+	insertSession("automated_thinking_drop", "", "", recent, 1, 1, 1)
+	_, err = conn.Exec(
+		`UPDATE messages
+		 SET thinking_text = 'private reasoning', has_thinking = 1
+		 WHERE session_id IN ('old_thinking_keep', 'automated_thinking_drop')`,
+	)
+	require.NoError(t, err)
 
 	_, err = conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
 	require.NoError(t, err)
@@ -220,7 +228,7 @@ func TestExtractDBKeepsOnlyHumanRootTrees(t *testing.T) {
 	}
 	require.NoError(t, rows.Err())
 
-	assert.Equal(t, []string{"child_keep", "old_child_keep", "root_keep"}, ids)
+	assert.Equal(t, []string{"child_keep", "old_child_keep", "old_thinking_keep", "root_keep"}, ids)
 
 	var automatedCount int
 	require.NoError(t, outConn.QueryRow(
