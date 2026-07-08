@@ -3,9 +3,6 @@
 package sync
 
 import (
-	"encoding/binary"
-	"os"
-
 	"go.kenn.io/agentsview/internal/parser"
 )
 
@@ -17,116 +14,10 @@ import (
 // untouched archive used to re-open and re-parse every session on every
 // pass. The gate restores an O(1) answer for the common idle case: when the
 // container file provably has not changed since a pass that verified every
-// one of its sessions, none of its sessions can have changed either, and
-// they all skip before fingerprinting.
-//
-// "Provably" deliberately does not rest on timestamp equality. Filesystem
-// mtime granularity varies (ns on APFS/ext4, 1s on HFS+, 2s on FAT), so two
-// different container states can carry equal mtimes. The state instead
-// folds in SQLite's own write markers, which advance on every committed
-// transaction regardless of any clock:
-//
-//   - the 32-bit file change counter at byte 24 of the database header
-//     (bumped per transaction in rollback-journal mode, and on every
-//     checkpoint in WAL mode), and
-//   - the WAL header's checkpoint sequence number and random salts, plus
-//     the WAL size: between WAL resets commits only append frames (the WAL
-//     grows), and every WAL reset re-randomizes the salts.
-//
-// File sizes and mtimes still participate as extra signal: a spurious
-// mismatch merely costs one re-parse, while a wrong match is what the
-// write markers rule out.
-type sqliteContainerState struct {
-	dbSize          int64
-	dbMtimeNS       int64
-	dbChangeCounter uint32
-	walSize         int64
-	walMtimeNS      int64
-	walCkptSeq      uint32
-	walSalt1        uint32
-	walSalt2        uint32
-}
-
-const (
-	// sqliteHeaderProbeSize covers the 100-byte SQLite database header;
-	// the file change counter lives at bytes 24-27 (big-endian).
-	sqliteHeaderProbeSize = 100
-	// sqliteGateWALHeaderSize is the 32-byte WAL header. A WAL at or under
-	// this size carries no transaction frames, so it is equivalent to an
-	// absent WAL: read-only SQLite clients can leave an empty WAL behind
-	// without implying any content change.
-	sqliteGateWALHeaderSize = 32
-)
-
-var sqliteHeaderMagic = []byte("SQLite format 3\x00")
-
-// statSQLiteContainerState captures the current change-detection state of a
-// shared SQLite container. ok is false when the container is missing or its
-// headers cannot be read, in which case the container must never be
-// trusted as unchanged.
-func statSQLiteContainerState(dbPath string) (sqliteContainerState, bool) {
-	info, err := os.Stat(dbPath)
-	if err != nil || !info.Mode().IsRegular() {
-		return sqliteContainerState{}, false
-	}
-	state := sqliteContainerState{
-		dbSize:    info.Size(),
-		dbMtimeNS: info.ModTime().UnixNano(),
-	}
-	counter, ok := readSQLiteChangeCounter(dbPath)
-	if !ok {
-		return sqliteContainerState{}, false
-	}
-	state.dbChangeCounter = counter
-
-	walPath := dbPath + "-wal"
-	walInfo, err := os.Stat(walPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return state, true
-		}
-		return sqliteContainerState{}, false
-	}
-	if !walInfo.Mode().IsRegular() ||
-		walInfo.Size() <= sqliteGateWALHeaderSize {
-		// Frameless WALs are indistinguishable from absent ones; see
-		// sqliteGateWALHeaderSize.
-		return state, true
-	}
-	header := make([]byte, sqliteGateWALHeaderSize)
-	f, err := os.Open(walPath)
-	if err != nil {
-		return sqliteContainerState{}, false
-	}
-	defer f.Close()
-	if _, err := f.ReadAt(header, 0); err != nil {
-		return sqliteContainerState{}, false
-	}
-	state.walSize = walInfo.Size()
-	state.walMtimeNS = walInfo.ModTime().UnixNano()
-	state.walCkptSeq = binary.BigEndian.Uint32(header[12:16])
-	state.walSalt1 = binary.BigEndian.Uint32(header[16:20])
-	state.walSalt2 = binary.BigEndian.Uint32(header[20:24])
-	return state, true
-}
-
-func readSQLiteChangeCounter(dbPath string) (uint32, bool) {
-	f, err := os.Open(dbPath)
-	if err != nil {
-		return 0, false
-	}
-	defer f.Close()
-	header := make([]byte, sqliteHeaderProbeSize)
-	if _, err := f.ReadAt(header, 0); err != nil {
-		return 0, false
-	}
-	for i, b := range sqliteHeaderMagic {
-		if header[i] != b {
-			return 0, false
-		}
-	}
-	return binary.BigEndian.Uint32(header[24:28]), true
-}
+// one of its sessions — as decided by parser.SQLiteContainerState, which
+// rests on SQLite's own write markers rather than timestamp precision —
+// none of its sessions can have changed either, and they all skip before
+// fingerprinting.
 
 // openCodeFamilySQLiteAgents lists the agents whose sessions live in a
 // shared OpenCode-format SQLite container.
@@ -173,7 +64,7 @@ func sqliteContainerPathForResultPath(path string) string {
 // by the single collectAndBatch goroutine, so no locking is needed during
 // the pass.
 type sqliteContainerPass struct {
-	captured   map[string]sqliteContainerState
+	captured   map[string]parser.SQLiteContainerState
 	discovered map[string]int
 	completed  map[string]int
 	failed     map[string]bool
@@ -202,7 +93,7 @@ func (e *Engine) beginSQLiteContainerPass(files []parser.DiscoveredFile) {
 		}
 		if pass == nil {
 			pass = &sqliteContainerPass{
-				captured:   make(map[string]sqliteContainerState),
+				captured:   make(map[string]parser.SQLiteContainerState),
 				discovered: make(map[string]int),
 				completed:  make(map[string]int),
 				failed:     make(map[string]bool),
@@ -210,7 +101,7 @@ func (e *Engine) beginSQLiteContainerPass(files []parser.DiscoveredFile) {
 		}
 		pass.discovered[dbPath]++
 		if _, seen := pass.captured[dbPath]; !seen {
-			if state, ok := statSQLiteContainerState(dbPath); ok {
+			if state, ok := parser.StatSQLiteContainerState(dbPath); ok {
 				pass.captured[dbPath] = state
 			} else {
 				pass.failed[dbPath] = true
@@ -299,7 +190,7 @@ func (e *Engine) finishSQLiteContainerPass(incomplete bool) {
 		}
 		if e.trustedSQLiteContainers == nil {
 			e.trustedSQLiteContainers =
-				make(map[string]sqliteContainerState)
+				make(map[string]parser.SQLiteContainerState)
 		}
 		e.trustedSQLiteContainers[dbPath] = state
 	}

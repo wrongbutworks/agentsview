@@ -158,7 +158,7 @@ type Engine struct {
 	// the bookkeeping for the pass currently running (nil outside
 	// passes). Both are in-memory only: a restart re-verifies once.
 	containerMu             gosync.Mutex
-	trustedSQLiteContainers map[string]sqliteContainerState
+	trustedSQLiteContainers map[string]parser.SQLiteContainerState
 	containerPass           *sqliteContainerPass
 }
 
