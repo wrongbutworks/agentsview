@@ -43,6 +43,17 @@ type SQLiteContainerState struct {
 // file change counter lives at bytes 24-27 (big-endian).
 const sqliteHeaderProbeSize = 100
 
+// The documented WAL header magic values (byte order of the frame
+// checksums) and the only WAL format version ever published (stable since
+// SQLite 3.7.0). The salts and checkpoint sequence are only meaningful
+// under this exact format, so anything else fails closed to "never
+// trusted".
+const (
+	sqliteWALMagicBE = 0x377f0683
+	sqliteWALMagicLE = 0x377f0682
+	sqliteWALVersion = 3007000
+)
+
 var sqliteHeaderMagic = []byte("SQLite format 3\x00")
 
 // StatSQLiteContainerState captures the current change-detection state of a
@@ -86,6 +97,13 @@ func StatSQLiteContainerState(dbPath string) (SQLiteContainerState, bool) {
 	}
 	defer f.Close()
 	if _, err := f.ReadAt(header, 0); err != nil {
+		return SQLiteContainerState{}, false
+	}
+	magic := binary.BigEndian.Uint32(header[0:4])
+	if magic != sqliteWALMagicBE && magic != sqliteWALMagicLE {
+		return SQLiteContainerState{}, false
+	}
+	if binary.BigEndian.Uint32(header[4:8]) != sqliteWALVersion {
 		return SQLiteContainerState{}, false
 	}
 	state.WALSize = walInfo.Size()

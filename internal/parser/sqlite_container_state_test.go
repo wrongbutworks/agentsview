@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"encoding/binary"
 	"os"
 	"testing"
 	"time"
@@ -50,6 +51,53 @@ func TestSQLiteContainerStateRejectsNonSQLiteFiles(t *testing.T) {
 	))
 	_, ok := StatSQLiteContainerState(path)
 	assert.False(t, ok, "non-SQLite bytes must not produce a container state")
+}
+
+// TestSQLiteContainerStateRejectsUnknownWALFormat pins that the WAL fields
+// are only trusted when the WAL header carries the documented magic and
+// format version (3007000). The salts and checkpoint sequence are what make
+// the equality check sound; under any other format those bytes are opaque,
+// so the container must fail closed to "never trusted" instead.
+func TestSQLiteContainerStateRejectsUnknownWALFormat(t *testing.T) {
+	writeWAL := func(t *testing.T, dbPath string, magic, version uint32) {
+		t.Helper()
+		header := make([]byte, 40)
+		binary.BigEndian.PutUint32(header[0:4], magic)
+		binary.BigEndian.PutUint32(header[4:8], version)
+		binary.BigEndian.PutUint32(header[12:16], 7)  // checkpoint seq
+		binary.BigEndian.PutUint32(header[16:20], 11) // salt-1
+		binary.BigEndian.PutUint32(header[20:24], 13) // salt-2
+		require.NoError(t, os.WriteFile(dbPath+"-wal", header, 0o644))
+	}
+
+	t.Run("documented header is read", func(t *testing.T) {
+		dbPath, _, db := newTestDB(t)
+		require.NoError(t, db.Close())
+		writeWAL(t, dbPath, 0x377f0683, 3007000)
+		state, ok := StatSQLiteContainerState(dbPath)
+		require.True(t, ok, "documented WAL header must be readable")
+		assert.Equal(t, uint32(7), state.WALCkptSeq)
+		assert.Equal(t, uint32(11), state.WALSalt1)
+		assert.Equal(t, uint32(13), state.WALSalt2)
+	})
+
+	t.Run("wrong magic fails closed", func(t *testing.T) {
+		dbPath, _, db := newTestDB(t)
+		require.NoError(t, db.Close())
+		writeWAL(t, dbPath, 0xdeadbeef, 3007000)
+		_, ok := StatSQLiteContainerState(dbPath)
+		assert.False(t, ok,
+			"a WAL without the documented magic must never be trusted")
+	})
+
+	t.Run("unknown version fails closed", func(t *testing.T) {
+		dbPath, _, db := newTestDB(t)
+		require.NoError(t, db.Close())
+		writeWAL(t, dbPath, 0x377f0682, 3008000)
+		_, ok := StatSQLiteContainerState(dbPath)
+		assert.False(t, ok,
+			"an unknown WAL format version must never be trusted")
+	})
 }
 
 // TestOpenCodeProjectsCacheReusesUntilContainerChanges pins the
