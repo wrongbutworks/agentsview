@@ -785,10 +785,11 @@ func TestSyncEngineOpenCodeSQLiteCutoffPassMustNotTrustContainer(
 }
 
 // TestSyncEngineOpenCodeStorageUntouchedSessionSkipsReparse pins the
-// per-session freshness gate for file-backed storage sessions: once a full
-// sync has verified a session as already stored, an untouched session must
-// skip before fingerprinting and parsing. The part file is made unreadable
-// for the gated pass, so any attempt to re-read the tree would surface as a
+// per-session freshness gate for file-backed storage sessions: once a pass
+// has written (or verified) a session, an untouched session must skip
+// before fingerprinting and parsing on every later pass — including the
+// very next one after the write. The part file is made unreadable for the
+// gated pass, so any attempt to re-read the tree would surface as a
 // failure instead of a skip.
 func TestSyncEngineOpenCodeStorageUntouchedSessionSkipsReparse(
 	t *testing.T,
@@ -814,14 +815,8 @@ func TestSyncEngineOpenCodeStorageUntouchedSessionSkipsReparse(
 	require.False(t, stats.Aborted, "first sync aborted: %+v", stats)
 	assert.Equal(t, 1, stats.Synced, "first sync writes the session")
 
-	// The pass after a write re-parses once, verifies every result as
-	// already stored (dropped without a skip tally), and only then trusts
-	// the session's stat signature.
-	stats = env.engine.SyncAll(context.Background(), nil)
-	require.False(t, stats.Aborted, "second sync aborted: %+v", stats)
-	assert.Equal(t, 0, stats.Synced,
-		"untouched session must not be re-emitted")
-
+	// The write pass itself promotes the session's stat signature, so
+	// the very next pass must already gate-skip it.
 	require.NoError(t, os.Chmod(partPath, 0o000), "make part unreadable")
 	t.Cleanup(func() {
 		_ = os.Chmod(partPath, 0o644)

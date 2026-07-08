@@ -164,9 +164,9 @@ type Engine struct {
 	// storageTrustMu guards trustedStorageSessions, the per-session
 	// freshness gate for OpenCode-family file-backed storage sessions
 	// (see opencode_storage_gate.go). It maps a session JSON path to the
-	// stat signature captured before the last pass that verified every
-	// parsed result as already stored. In-memory only: a restart
-	// re-verifies once.
+	// stat signature captured before the last parse whose outcome the
+	// archive absorbed (results dropped as already stored, or confirmed
+	// written). In-memory only: a restart re-verifies once.
 	storageTrustMu         gosync.Mutex
 	trustedStorageSessions map[string]string
 }
@@ -3495,11 +3495,13 @@ func (e *Engine) collectAndBatch(
 		} else {
 			for _, pr := range allowed {
 				pending = append(pending, pendingWrite{
-					sess:         pr.Session,
-					msgs:         pr.Messages,
-					usageEvents:  pr.UsageEvents,
-					needsRetry:   r.needsRetryForSession(pr.Session.ID),
-					forceReplace: r.forceReplace,
+					sess:              pr.Session,
+					msgs:              pr.Messages,
+					usageEvents:       pr.UsageEvents,
+					needsRetry:        r.needsRetryForSession(pr.Session.ID),
+					forceReplace:      r.forceReplace,
+					storageTrustPath:  r.storageTrustPath,
+					storageTrustState: r.storageTrustState,
 				})
 			}
 			// A Kiro SQLite store is discovered as one container source
@@ -3528,6 +3530,9 @@ func (e *Engine) collectAndBatch(
 			if failedWrites > 0 {
 				e.poisonSQLiteContainerPass()
 			}
+			e.promoteOpenCodeStorageTrustAfterWrite(
+				pending, writtenSessions, failedWrites, cwdFiltered,
+			)
 			stats.cwdFilteredSessions += cwdFiltered
 			progress.MessagesIndexed += writtenMessages
 			stats.messagesIndexed = progress.MessagesIndexed
@@ -3549,6 +3554,9 @@ flush:
 		if failedWrites > 0 {
 			e.poisonSQLiteContainerPass()
 		}
+		e.promoteOpenCodeStorageTrustAfterWrite(
+			pending, writtenSessions, failedWrites, cwdFiltered,
+		)
 		stats.cwdFilteredSessions += cwdFiltered
 		progress.MessagesIndexed += writtenMessages
 		stats.messagesIndexed = progress.MessagesIndexed
@@ -3647,6 +3655,12 @@ type processResult struct {
 	// suppressPresenceSweep marks an incomplete source result where
 	// missing stored sessions are expected rather than parser drift.
 	suppressPresenceSweep bool
+	// storageTrustPath/State carry an OpenCode-family storage session's
+	// pre-parse stat signature to the write path, which promotes it once
+	// the session's batch is confirmed fully written (see
+	// opencode_storage_gate.go). Empty for everything else.
+	storageTrustPath  string
+	storageTrustState string
 }
 
 func (r processResult) needsRetryForSession(sessionID string) bool {
@@ -4080,23 +4094,13 @@ func (e *Engine) processProviderFile(
 			})
 		}
 	}
-	if storageStateOK {
-		// Promote only a pass that verified the session end to end: a
-		// complete result set whose every parsed result was dropped as
-		// already stored, with no exclusions or deferred retries.
-		// Anything else — changed content, retries, exclusions — must
-		// re-verify next pass.
-		if outcome.ResultSetComplete &&
-			parsedCount > 0 &&
-			len(res.results) == 0 &&
-			len(res.excludedSessionIDs) == 0 &&
-			res.retrySessionIDs == nil {
-			e.promoteOpenCodeStorageSession(file.Path, storageState)
-		} else {
-			e.invalidateOpenCodeStorageSession(file.Path)
-		}
-	}
 	e.applyProviderFilePathPolicies(provider, file.Agent, &res)
+	if storageStateOK {
+		e.stageOpenCodeStorageTrust(
+			&res, file.Path, storageState,
+			parsedCount, outcome.ResultSetComplete,
+		)
+	}
 	return res, true
 }
 
@@ -5833,6 +5837,11 @@ type pendingWrite struct {
 	usageEvents  []parser.ParsedUsageEvent
 	needsRetry   bool
 	forceReplace bool
+	// storageTrustPath/State promote the session's OpenCode storage-gate
+	// trust after its batch is confirmed fully written. Empty for
+	// everything else.
+	storageTrustPath  string
+	storageTrustState string
 }
 
 func dataVersionForWrite(pw pendingWrite) int {

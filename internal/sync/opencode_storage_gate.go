@@ -23,8 +23,9 @@ import (
 // parser.StatOpenCodeStorageSessionState, a per-file (name, size, mtimeNS)
 // signature over exactly the files the parse would read. A session is
 // skipped before fingerprinting only when its current signature equals one
-// captured before a parse that the engine then verified against the stored
-// archive (every parsed result dropped as unchanged). The remaining blind
+// captured before a parse whose outcome the archive then absorbed: either
+// every parsed result was dropped as already stored, or the results were
+// confirmed fully written by the batch write path. The remaining blind
 // spot — an in-place child rewrite preserving both size and mtime — is
 // covered on the watcher path by invalidating trust for a session whenever
 // a changed-path event resolves to it, so an event-signaled change always
@@ -103,10 +104,11 @@ func (e *Engine) openCodeStorageSessionFresh(path, state string) bool {
 }
 
 // promoteOpenCodeStorageSession records a stat signature that was captured
-// before a parse whose every result the engine verified as already stored.
-// The capture-before-parse ordering makes races safe: a write landing
-// between capture and parse leaves the parsed content newer than the
-// signature, so the next capture mismatches and re-verifies.
+// before a parse whose outcome the archive has since absorbed (results
+// dropped as already stored, or confirmed written). The
+// capture-before-parse ordering makes races safe: a write landing between
+// capture and parse leaves the parsed content newer than the signature, so
+// the next capture mismatches and re-verifies.
 func (e *Engine) promoteOpenCodeStorageSession(path, state string) {
 	if path == "" || state == "" {
 		return
@@ -117,6 +119,55 @@ func (e *Engine) promoteOpenCodeStorageSession(path, state string) {
 		e.trustedStorageSessions = make(map[string]string)
 	}
 	e.trustedStorageSessions[path] = state
+}
+
+// stageOpenCodeStorageTrust decides what a finished parse means for the
+// session's gate trust. A complete result set with no exclusions or
+// deferred retries either re-verified the session (every result dropped as
+// already stored — promote immediately) or produced content headed for the
+// write batch (stage the state on the result; the write path promotes it
+// once the batch is confirmed fully written). Anything else — retries,
+// exclusions, policy-suppressed results — invalidates so the next pass
+// re-verifies by content.
+func (e *Engine) stageOpenCodeStorageTrust(
+	res *processResult,
+	path, state string,
+	parsedCount int,
+	resultSetComplete bool,
+) {
+	clean := resultSetComplete &&
+		parsedCount > 0 &&
+		len(res.excludedSessionIDs) == 0 &&
+		res.retrySessionIDs == nil
+	if clean && len(res.results) == 0 {
+		e.promoteOpenCodeStorageSession(path, state)
+		return
+	}
+	e.invalidateOpenCodeStorageSession(path)
+	if clean {
+		res.storageTrustPath = path
+		res.storageTrustState = state
+	}
+}
+
+// promoteOpenCodeStorageTrustAfterWrite promotes the staged trust of every
+// session in a written batch, but only when the batch verifiably persisted
+// all of it: any failed, cwd-vetoed, or otherwise unwritten session leaves
+// the whole batch unpromoted (write failures are not attributable to
+// individual sessions), so those sessions re-verify on the next pass.
+func (e *Engine) promoteOpenCodeStorageTrustAfterWrite(
+	batch []pendingWrite,
+	writtenSessions, failedWrites, cwdFiltered int,
+) {
+	if failedWrites > 0 || cwdFiltered > 0 ||
+		writtenSessions != len(batch) {
+		return
+	}
+	for _, pw := range batch {
+		e.promoteOpenCodeStorageSession(
+			pw.storageTrustPath, pw.storageTrustState,
+		)
+	}
 }
 
 // invalidateOpenCodeStorageSession drops trust for one session. Called when
