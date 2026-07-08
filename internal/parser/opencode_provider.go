@@ -284,6 +284,11 @@ func (spec openCodeProviderSpec) parseSQLite(
 type openCodeFormatSource struct {
 	Root string
 	Path string
+	// MTimeNS carries the session's time_updated (already listed during
+	// SQLite discovery, scaled to nanoseconds) so Fingerprint does not
+	// reopen the shared DB once per session. Zero means unknown and makes
+	// Fingerprint fall back to querying the DB.
+	MTimeNS int64
 }
 
 type openCodeFormatSourceSet struct {
@@ -436,9 +441,13 @@ func (s openCodeFormatSourceSet) Fingerprint(
 	if !ok {
 		return SourceFingerprint{}, fmt.Errorf("%s source path unavailable", s.spec.agent)
 	}
-	mtime, err := s.spec.sourceMtime(path)
-	if err != nil {
-		return SourceFingerprint{}, err
+	mtime := sourceCarriedMTimeNS(source)
+	if mtime == 0 {
+		var err error
+		mtime, err = s.spec.sourceMtime(path)
+		if err != nil {
+			return SourceFingerprint{}, err
+		}
 	}
 	fingerprint := SourceFingerprint{
 		Key:     firstNonEmptyJSONLString(source.FingerprintKey, source.Key, path),
@@ -465,6 +474,21 @@ func (s openCodeFormatSourceSet) Fingerprint(
 		return SourceFingerprint{}, err
 	}
 	return fingerprint, nil
+}
+
+// sourceCarriedMTimeNS returns the discovery-listed session mtime carried on
+// a SQLite-backed source, or zero when the source was built without one
+// (storage sessions, FindSource lookups).
+func sourceCarriedMTimeNS(source SourceRef) int64 {
+	switch src := source.Opaque.(type) {
+	case openCodeFormatSource:
+		return src.MTimeNS
+	case *openCodeFormatSource:
+		if src != nil {
+			return src.MTimeNS
+		}
+	}
+	return 0
 }
 
 func (s openCodeFormatSourceSet) pathFromSource(source SourceRef) (string, bool) {
@@ -514,7 +538,7 @@ func (s openCodeFormatSourceSet) sqliteSources(
 		// sourceRef, which reopens the same SQLite DB once per row via
 		// OpenCodeSQLiteSessionExists (O(n) opens for n sessions, and it would
 		// silently drop a row whose redundant probe failed).
-		source, ok := s.sqliteSourceRefFromMeta(root, meta.VirtualPath)
+		source, ok := s.sqliteSourceRefFromMeta(root, meta)
 		if !ok {
 			continue
 		}
@@ -527,13 +551,14 @@ func (s openCodeFormatSourceSet) sqliteSources(
 // from the SQLite DB at root. It validates the virtual path parses and that its
 // DB lives under root, but unlike sourceRef it skips the per-row
 // OpenCodeSQLiteSessionExists probe because the caller read the row from that
-// same DB moments earlier.
+// same DB moments earlier. The listed time_updated rides along so Fingerprint
+// does not reopen the DB per session.
 func (s openCodeFormatSourceSet) sqliteSourceRefFromMeta(
 	root string,
-	virtualPath string,
+	meta OpenCodeSessionMeta,
 ) (SourceRef, bool) {
 	root = filepath.Clean(root)
-	path := filepath.Clean(virtualPath)
+	path := filepath.Clean(meta.VirtualPath)
 	dbPath, _, ok := s.spec.parseVirtual(path)
 	if !ok {
 		return SourceRef{}, false
@@ -541,7 +566,12 @@ func (s openCodeFormatSourceSet) sqliteSourceRefFromMeta(
 	if _, under := relUnder(root, dbPath); !under {
 		return SourceRef{}, false
 	}
-	return s.newSourceRef(root, path, ""), true
+	ref := s.newSourceRef(root, path, "")
+	if src, ok := ref.Opaque.(openCodeFormatSource); ok {
+		src.MTimeNS = meta.FileMtime
+		ref.Opaque = src
+	}
+	return ref, true
 }
 
 func (s openCodeFormatSourceSet) sourcesForChangedPathInRoot(

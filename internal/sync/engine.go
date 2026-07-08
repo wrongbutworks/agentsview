@@ -150,6 +150,16 @@ type Engine struct {
 	// sessions don't rescan their whole history on every appended
 	// line. Close flushes and stops it.
 	signalSched *signalScheduler
+
+	// containerMu guards the OpenCode-family shared-SQLite freshness
+	// gate (see opencode_container_gate.go). trustedSQLiteContainers
+	// maps a container DB path to its state at the end of the last
+	// pass that verified every one of its sessions; containerPass is
+	// the bookkeeping for the pass currently running (nil outside
+	// passes). Both are in-memory only: a restart re-verifies once.
+	containerMu             gosync.Mutex
+	trustedSQLiteContainers map[string]sqliteContainerState
+	containerPass           *sqliteContainerPass
 }
 
 // PhaseStats returns the engine's phase counter. The values reflect only
@@ -555,11 +565,20 @@ func (e *Engine) SyncPaths(paths []string) {
 	e.resetS3CodexIndexCache()
 
 	e.anomalies.reset()
+	// Begin a container pass so an already-trusted, unchanged container
+	// still gates its fan-out (a spurious watcher event on the DB file
+	// costs nothing), but never promote from here: a changed-path pass is
+	// not guaranteed to cover a container's complete session set (a hybrid
+	// root can fan a single message path out to one SQLite-backed
+	// session), and promotion from a subset would be unsound. The next
+	// full sync re-verifies and re-trusts (see opencode_container_gate.go).
+	e.beginSQLiteContainerPass(files)
 	results := e.startWorkers(context.Background(), files)
 	stats = e.collectAndBatch(
 		context.Background(), results, len(files), len(files), nil,
 		syncWriteDefault,
 	)
+	e.finishSQLiteContainerPass(true)
 	e.anomalies.applyTo(&stats)
 	e.persistSkipCache()
 
@@ -1132,6 +1151,10 @@ func (e *Engine) resyncAllLocked(
 			Hint:   hint,
 		})
 	}
+
+	// Resync rebuilds the archive from scratch, so every shared-SQLite
+	// container must be re-verified against the fresh database.
+	e.clearTrustedSQLiteContainers()
 
 	origDB := e.db
 	origPath := origDB.Path()
@@ -1883,6 +1906,12 @@ func (e *Engine) syncAllLocked(
 	}
 	all = append(all, providerFound...)
 
+	// Capture shared-SQLite container states from the pre-filter discovery
+	// set: promotion needs a completion for every discovered session, so a
+	// cutoff-filtered pass must stay unpromotable (see
+	// opencode_container_gate.go).
+	e.beginSQLiteContainerPass(providerFound)
+
 	quickSyncCutoff := !since.IsZero()
 	if quickSyncCutoff {
 		all = e.dedupeClaudeDiscoveredFiles(all)
@@ -1962,6 +1991,11 @@ func (e *Engine) syncAllLocked(
 	for range providerFailures {
 		stats.RecordFailed()
 	}
+	// Discovery failures cannot be attributed to a provider here, so any
+	// failure conservatively blocks every container promotion this pass.
+	e.finishSQLiteContainerPass(
+		stats.Aborted || ctx.Err() != nil || providerFailures > 0,
+	)
 	stats.nonContainerDiscovered = nonContainerDiscovered
 	if verbose {
 		log.Printf(
@@ -3306,6 +3340,7 @@ func (e *Engine) collectAndBatch(
 				goto flush
 			}
 			stats.RecordFailed()
+			e.noteSQLiteContainerResult(r.path, false)
 			if r.cacheSkip && r.mtime != 0 && !r.noCacheSkip {
 				e.cacheSkip(r.skipCacheKey(), r.mtime, r.sourceFingerprint)
 			}
@@ -3317,6 +3352,7 @@ func (e *Engine) collectAndBatch(
 				e.cacheSkip(r.skipCacheKey(), r.mtime)
 			}
 			stats.RecordSkip()
+			e.noteSQLiteContainerResult(r.path, true)
 			progress.SessionsDone++
 			e.reportProgress(onProgress, progress)
 			continue
@@ -3340,6 +3376,7 @@ func (e *Engine) collectAndBatch(
 			); err != nil {
 				log.Printf("delete parser-excluded sessions: %v", err)
 				stats.RecordFailed()
+				e.noteSQLiteContainerResult(r.path, false)
 				continue
 			}
 			stats.parserExcludedIDs = append(
@@ -3355,6 +3392,7 @@ func (e *Engine) collectAndBatch(
 			if r.cacheSkip && !r.noCacheSkip {
 				e.cacheSkip(r.skipCacheKey(), r.mtime, r.sourceFingerprint)
 			}
+			e.noteSQLiteContainerResult(r.path, true)
 			progress.SessionsDone++
 			e.reportProgress(onProgress, progress)
 			continue
@@ -3363,6 +3401,9 @@ func (e *Engine) collectAndBatch(
 			e.clearSkip(r.skipCacheKey())
 		}
 		stats.filesOK++
+		// Sessions parsed at DataVersionNeedsRetry are deferred work, not
+		// verified state, so their container must stay untrusted.
+		e.noteSQLiteContainerResult(r.path, len(r.retrySessionIDs) == 0)
 
 		// Drop sessions outside the cwd allow-list before batching so
 		// the sync stats can tell an intentionally filtered file apart
@@ -3421,6 +3462,11 @@ func (e *Engine) collectAndBatch(
 			for range failedWrites {
 				stats.RecordFailed()
 			}
+			// Batch write failures cannot be attributed to individual
+			// sessions, so they block every container promotion this pass.
+			if failedWrites > 0 {
+				e.poisonSQLiteContainerPass()
+			}
 			stats.cwdFilteredSessions += cwdFiltered
 			progress.MessagesIndexed += writtenMessages
 			stats.messagesIndexed = progress.MessagesIndexed
@@ -3438,6 +3484,9 @@ flush:
 		stats.RecordSynced(writtenSessions)
 		for range failedWrites {
 			stats.RecordFailed()
+		}
+		if failedWrites > 0 {
+			e.poisonSQLiteContainerPass()
 		}
 		stats.cwdFilteredSessions += cwdFiltered
 		progress.MessagesIndexed += writtenMessages
@@ -3691,6 +3740,14 @@ func (e *Engine) processProviderFile(
 	}
 	if file.ProviderSource != nil && !file.ProviderProcess && !usesProvider {
 		return processResult{}, false
+	}
+
+	// OpenCode-family shared-SQLite gate: when the whole container
+	// provably has not changed since the last fully verified pass, none
+	// of its sessions can have changed, so skip before paying for the
+	// per-session fingerprint (a DB open per source) and parse.
+	if e.sqliteContainerSourceFresh(file) {
+		return processResult{skip: true}, true
 	}
 
 	factory, ok := e.providerFactories[file.Agent]

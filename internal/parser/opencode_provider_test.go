@@ -317,6 +317,41 @@ func TestOpenCodeProviderSQLiteDiscoversAllListedSessions(t *testing.T) {
 	}
 }
 
+// TestOpenCodeProviderSQLiteFingerprintUsesDiscoveryMeta pins that
+// fingerprinting a discovered SQLite-backed session reuses the time_updated
+// already listed during discovery instead of reopening the shared DB once per
+// session. Replacing the DB with unreadable bytes after discovery makes any
+// reopen fail, so a successful fingerprint proves the metadata was carried on
+// the source.
+func TestOpenCodeProviderSQLiteFingerprintUsesDiscoveryMeta(t *testing.T) {
+
+	root := t.TempDir()
+	dbPath, seeder, db := newTestDBAt(t, filepath.Join(root, "opencode.db"))
+	seeder.AddProject("prj_1", "/home/user/code/sqlite-app")
+	seeder.AddSession(
+		"ses_meta", "prj_1", "", "Meta", 1700000000000, 1700000010000,
+	)
+	require.NoError(t, db.Close())
+
+	provider, ok := NewProvider(AgentOpenCode, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	discovered, err := provider.Discover(context.Background())
+	require.NoError(t, err)
+	require.Len(t, discovered, 1)
+
+	garbage := []byte("not a sqlite database")
+	require.NoError(t, os.WriteFile(dbPath, garbage, 0o644))
+
+	fp, err := provider.Fingerprint(context.Background(), discovered[0])
+	require.NoError(t, err,
+		"fingerprint must not reopen the SQLite DB for a discovered source")
+	assert.Equal(t, OpenCodeSQLiteVirtualPath(dbPath, "ses_meta"), fp.Key)
+	assert.Equal(t, int64(1700000010000000000), fp.MTimeNS,
+		"fingerprint mtime must be the discovered time_updated in ns")
+	assert.Equal(t, int64(len(garbage)), fp.Size,
+		"fingerprint size stays the shared container file size")
+}
+
 func TestOpenCodeProviderHybridDiscoveryFiltersSQLiteDuplicate(t *testing.T) {
 
 	root := t.TempDir()
