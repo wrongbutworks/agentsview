@@ -3,6 +3,7 @@ package parser
 import (
 	"encoding/binary"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 
@@ -51,6 +52,39 @@ func TestSQLiteContainerStateRejectsNonSQLiteFiles(t *testing.T) {
 	))
 	_, ok := StatSQLiteContainerState(path)
 	assert.False(t, ok, "non-SQLite bytes must not produce a container state")
+}
+
+// TestSQLiteContainerStateDetectsFileReplacement pins that swapping the
+// container for a different file is visible even when every header marker
+// and the stat metadata coincide: a byte-identical copy at a new inode with
+// a restored mtime must still change the state. Without file identity, a
+// restored or replaced database landing in the same second with the same
+// size and change counter would be indistinguishable from the original.
+func TestSQLiteContainerStateDetectsFileReplacement(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file identity is unavailable on Windows")
+	}
+	dbPath, _, db := newTestDB(t)
+	require.NoError(t, db.Close())
+
+	before, ok := StatSQLiteContainerState(dbPath)
+	require.True(t, ok, "state must be readable before replacement")
+
+	raw, err := os.ReadFile(dbPath)
+	require.NoError(t, err, "read container bytes")
+	info, err := os.Stat(dbPath)
+	require.NoError(t, err, "stat container")
+	require.NoError(t, os.Remove(dbPath), "remove container")
+	require.NoError(t, os.WriteFile(dbPath, raw, 0o644),
+		"recreate container with identical bytes")
+	require.NoError(t,
+		os.Chtimes(dbPath, info.ModTime(), info.ModTime()),
+		"restore container mtime")
+
+	after, ok := StatSQLiteContainerState(dbPath)
+	require.True(t, ok, "state must be readable after replacement")
+	assert.NotEqual(t, before, after,
+		"a replaced container file must change the state")
 }
 
 // TestSQLiteContainerStateRejectsUnknownWALFormat pins that the WAL fields

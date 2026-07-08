@@ -553,6 +553,9 @@ func (e *Engine) SyncPaths(paths []string) {
 	if e.refuseWriteInForceParse("SyncPaths") {
 		return
 	}
+	// Capture container states before classifyPaths lists any session rows,
+	// matching the capture-before-discovery ordering of full syncs.
+	preContainerStates := e.captureSQLiteContainerStates()
 	files := e.classifyPaths(paths)
 	if len(files) == 0 {
 		return
@@ -581,7 +584,7 @@ func (e *Engine) SyncPaths(paths []string) {
 	// root can fan a single message path out to one SQLite-backed
 	// session), and promotion from a subset would be unsound. The next
 	// full sync re-verifies and re-trusts (see opencode_container_gate.go).
-	e.beginSQLiteContainerPass(files)
+	e.beginSQLiteContainerPass(files, preContainerStates)
 	results := e.startWorkers(context.Background(), files)
 	stats = e.collectAndBatch(
 		context.Background(), results, len(files), len(files), nil,
@@ -1945,6 +1948,11 @@ func (e *Engine) syncAllLocked(
 		Detail: "Discovering sessions",
 	})
 
+	// Container states must be captured BEFORE discovery lists any session
+	// rows, so a promoted state can never be newer than the discovered
+	// session set (see captureSQLiteContainerStates).
+	preContainerStates := e.captureSQLiteContainerStates()
+
 	var all []parser.DiscoveredFile
 	counts := make(map[parser.AgentType]int)
 	providerFound, providerFailures := e.discoverProviderSources(ctx, scope)
@@ -1953,11 +1961,10 @@ func (e *Engine) syncAllLocked(
 	}
 	all = append(all, providerFound...)
 
-	// Capture shared-SQLite container states from the pre-filter discovery
-	// set: promotion needs a completion for every discovered session, so a
-	// cutoff-filtered pass must stay unpromotable (see
-	// opencode_container_gate.go).
-	e.beginSQLiteContainerPass(providerFound)
+	// Begin gate bookkeeping from the pre-filter discovery set: promotion
+	// needs a completion for every discovered session, so a cutoff-filtered
+	// pass must stay unpromotable (see opencode_container_gate.go).
+	e.beginSQLiteContainerPass(providerFound, preContainerStates)
 
 	quickSyncCutoff := !since.IsZero()
 	if quickSyncCutoff {
@@ -3448,9 +3455,6 @@ func (e *Engine) collectAndBatch(
 			e.clearSkip(r.skipCacheKey())
 		}
 		stats.filesOK++
-		// Sessions parsed at DataVersionNeedsRetry are deferred work, not
-		// verified state, so their container must stay untrusted.
-		e.noteSQLiteContainerResult(r.path, len(r.retrySessionIDs) == 0)
 
 		// Drop sessions outside the cwd allow-list before batching so
 		// the sync stats can tell an intentionally filtered file apart
@@ -3460,6 +3464,16 @@ func (e *Engine) collectAndBatch(
 		// allow-list change must be able to pick them up again.
 		allowed, vetoed := e.splitResultsByCwdFilter(r.results)
 		stats.cwdFilteredSessions += vetoed
+		// A cwd-vetoed session parsed fine but was deliberately not
+		// persisted, and sessions parsed at DataVersionNeedsRetry are
+		// deferred work — neither is verified state, so their container
+		// must stay untrusted. The vetoed case matters because the gate
+		// must never hide a filtered session from a future allow-list
+		// change; such containers simply keep the pre-gate re-verify
+		// behavior.
+		e.noteSQLiteContainerResult(
+			r.path, vetoed == 0 && len(r.retrySessionIDs) == 0,
+		)
 		if vetoed > 0 && len(allowed) == 0 {
 			stats.cwdFilteredFiles++
 			progress.SessionsDone++

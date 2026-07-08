@@ -697,6 +697,62 @@ func TestSyncEngineOpenCodeSQLiteWALOnlyChangeStillReemits(t *testing.T) {
 	)
 }
 
+// TestSyncEngineOpenCodeSQLiteCwdFilteredContainerStaysUntrusted pins the
+// promotion invariant against the cwd allow-list: a session that parses but
+// is vetoed by the filter was deliberately not persisted, so its container
+// was not fully verified and must never be trusted. A later sync must
+// re-verify the container (no gate skips) instead of hiding the vetoed
+// session behind the trusted state.
+func TestSyncEngineOpenCodeSQLiteCwdFilteredContainerStaysUntrusted(
+	t *testing.T,
+) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	root := t.TempDir()
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentOpenCode: {root},
+		},
+		Machine:            "local",
+		IncludeCwdPrefixes: []string{"/home/user/code/keep-app"},
+	})
+	oc := createOpenCodeDB(t, root)
+	oc.addProject(t, "proj-keep", "/home/user/code/keep-app")
+	oc.addProject(t, "proj-drop", "/home/user/code/drop-app")
+	seedOpenCodeSQLiteTextSession(
+		t, oc, "proj-keep", "keep-session",
+		1779012000000, 1779012030000,
+		"keep prompt", "keep answer",
+	)
+	seedOpenCodeSQLiteTextSession(
+		t, oc, "proj-drop", "drop-session",
+		1779012100000, 1779012130000,
+		"drop prompt", "drop answer",
+	)
+
+	stats := engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "first sync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced, "only the allowed session is written")
+
+	stats = engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "second sync aborted: %+v", stats)
+	assert.Equal(t, 0, stats.Skipped,
+		"a container with cwd-vetoed sessions must not be gate-skipped")
+
+	kept, err := database.GetSessionFull(
+		context.Background(), "opencode:keep-session",
+	)
+	require.NoError(t, err)
+	assert.NotNil(t, kept, "allowed session must be archived")
+	dropped, err := database.GetSessionFull(
+		context.Background(), "opencode:drop-session",
+	)
+	require.NoError(t, err)
+	assert.Nil(t, dropped, "vetoed session must stay out of the archive")
+}
+
 // TestSyncEngineOpenCodeSQLiteCutoffPassMustNotTrustContainer guards the
 // gate's promotion rule: a cutoff-filtered pass discovers the container but
 // processes none of its sessions, so it has verified nothing and a later

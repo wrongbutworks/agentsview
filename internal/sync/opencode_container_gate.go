@@ -3,6 +3,9 @@
 package sync
 
 import (
+	"path/filepath"
+	"strings"
+
 	"go.kenn.io/agentsview/internal/parser"
 )
 
@@ -71,14 +74,46 @@ type sqliteContainerPass struct {
 	poisoned   bool
 }
 
-// beginSQLiteContainerPass captures the container states for the discovered
-// files of a starting sync pass. It must be called before the pass's
-// workers start so that any write racing the pass lands after the capture
-// and therefore invalidates it on the next comparison. files must be the
-// pre-filter discovery set: promotion requires seeing a completion for
+// captureSQLiteContainerStates snapshots every configured OpenCode-family
+// SQLite container's state. It must run BEFORE discovery lists any session
+// rows: promotion may only trust a state that is at least as old as the
+// discovered session set, otherwise a session written between the listing
+// and a later capture would be promoted away and gate-skipped without ever
+// being parsed. Containers whose state cannot be read are simply absent
+// from the map and never promoted.
+func (e *Engine) captureSQLiteContainerStates() map[string]parser.SQLiteContainerState {
+	if e.forceParse {
+		return nil
+	}
+	states := make(map[string]parser.SQLiteContainerState)
+	for _, agent := range openCodeFamilySQLiteAgents {
+		for _, dir := range e.agentDirs[agent] {
+			if dir == "" || strings.HasPrefix(dir, "s3://") {
+				continue
+			}
+			src := resolveOpenCodeFormatSource(agent, filepath.Clean(dir))
+			if src.DBPath == "" {
+				continue
+			}
+			if state, ok := parser.StatSQLiteContainerState(src.DBPath); ok {
+				states[src.DBPath] = state
+			}
+		}
+	}
+	return states
+}
+
+// beginSQLiteContainerPass starts a pass's gate bookkeeping from the
+// discovered files and the pre-discovery container captures. files must be
+// the pre-filter discovery set: promotion requires seeing a completion for
 // every discovered session, so an mtime-cutoff or scope filter that drops
-// sessions from processing keeps the container untrusted.
-func (e *Engine) beginSQLiteContainerPass(files []parser.DiscoveredFile) {
+// sessions from processing keeps the container untrusted. A discovered
+// container with no pre-discovery capture is marked failed and can neither
+// gate-skip nor be promoted this pass.
+func (e *Engine) beginSQLiteContainerPass(
+	files []parser.DiscoveredFile,
+	preStates map[string]parser.SQLiteContainerState,
+) {
 	e.containerMu.Lock()
 	defer e.containerMu.Unlock()
 	e.containerPass = nil
@@ -100,12 +135,13 @@ func (e *Engine) beginSQLiteContainerPass(files []parser.DiscoveredFile) {
 			}
 		}
 		pass.discovered[dbPath]++
-		if _, seen := pass.captured[dbPath]; !seen {
-			if state, ok := parser.StatSQLiteContainerState(dbPath); ok {
-				pass.captured[dbPath] = state
-			} else {
-				pass.failed[dbPath] = true
-			}
+		if _, seen := pass.captured[dbPath]; seen || pass.failed[dbPath] {
+			continue
+		}
+		if state, ok := preStates[dbPath]; ok {
+			pass.captured[dbPath] = state
+		} else {
+			pass.failed[dbPath] = true
 		}
 	}
 	e.containerPass = pass
