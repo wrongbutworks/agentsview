@@ -10,7 +10,7 @@ OUTPUT="${2:-${OUTPUT:-/data/test-sessions.db}}"
 HISTORY_DAYS="${SCREENSHOT_HISTORY_DAYS:-60}"
 BLOCKED_TERMS_FILE="${SCREENSHOT_BLOCKED_TERMS_FILE:-$HOME/.config/agentsview-docs/screenshot-blocked-terms.txt}"
 BLOCKED_TERMS="${SCREENSHOT_BLOCKED_TERMS:-}"
-BLOCKED_PATTERNS_SQL="$(mktemp "${TMPDIR:-/tmp}/agentsview-screenshot-blocked-patterns.XXXXXX.sql")"
+BLOCKED_PATTERNS_SQL="$(mktemp "${TMPDIR:-/tmp}/agentsview-screenshot-blocked-patterns.XXXXXX")"
 trap 'rm -f "$BLOCKED_PATTERNS_SQL"' EXIT
 
 if [ -f "$BLOCKED_TERMS_FILE" ]; then
@@ -101,27 +101,21 @@ INSERT INTO screenshot_projects(name) VALUES
   ('roborev'),
   ('roborev_docs');
 
+CREATE TEMP TABLE screenshot_safe_sessions(id TEXT PRIMARY KEY);
+CREATE TEMP TABLE screenshot_root_sessions(id TEXT PRIMARY KEY);
 CREATE TEMP TABLE screenshot_sessions(id TEXT PRIMARY KEY);
 CREATE TEMP TABLE screenshot_bounds(
   cutoff_session_at TEXT,
   newest_session_at TEXT
 );
-INSERT INTO screenshot_bounds(cutoff_session_at, newest_session_at)
-SELECT
-  datetime(max(session_at), printf('-%d days', @history_days)),
-  max(session_at)
-FROM (
-  SELECT datetime(COALESCE(NULLIF(s.started_at, ''), s.created_at)) AS session_at
-  FROM sessions s
-  WHERE s.project IN (SELECT name FROM screenshot_projects)
-);
 
-INSERT INTO screenshot_sessions(id)
+INSERT INTO screenshot_safe_sessions(id)
 SELECT id
 FROM sessions s
-CROSS JOIN screenshot_bounds b
 WHERE s.project IN (SELECT name FROM screenshot_projects)
-  AND datetime(COALESCE(NULLIF(s.started_at, ''), s.created_at)) >= b.cutoff_session_at
+  AND s.message_count > 0
+  AND s.deleted_at IS NULL
+  AND COALESCE(s.is_automated, 0) = 0
   AND NOT EXISTS (
     SELECT 1
     FROM screenshot_blocked_patterns p
@@ -163,6 +157,38 @@ WHERE s.project IN (SELECT name FROM screenshot_projects)
       ON lower(COALESCE(tre.content, '')) LIKE p.pattern ESCAPE '\'
     WHERE tre.session_id = s.id
   );
+
+INSERT INTO screenshot_bounds(cutoff_session_at, newest_session_at)
+SELECT
+  datetime(max(session_at), printf('-%d days', @history_days)),
+  max(session_at)
+FROM (
+  SELECT datetime(COALESCE(NULLIF(s.started_at, ''), s.created_at)) AS session_at
+  FROM sessions s
+  JOIN screenshot_safe_sessions safe ON safe.id = s.id
+  WHERE COALESCE(s.parent_session_id, '') = ''
+    AND s.relationship_type NOT IN ('subagent', 'fork', 'continuation')
+);
+
+INSERT INTO screenshot_root_sessions(id)
+SELECT s.id
+FROM sessions s
+JOIN screenshot_safe_sessions safe ON safe.id = s.id
+CROSS JOIN screenshot_bounds b
+WHERE COALESCE(s.parent_session_id, '') = ''
+  AND s.relationship_type NOT IN ('subagent', 'fork', 'continuation')
+  AND datetime(COALESCE(NULLIF(s.started_at, ''), s.created_at)) >= b.cutoff_session_at;
+
+WITH RECURSIVE screenshot_tree(id) AS (
+  SELECT id FROM screenshot_root_sessions
+  UNION
+  SELECT child.id
+  FROM sessions child
+  JOIN screenshot_tree parent ON child.parent_session_id = parent.id
+  JOIN screenshot_safe_sessions safe ON safe.id = child.id
+)
+INSERT INTO screenshot_sessions(id)
+SELECT id FROM screenshot_tree;
 
 -- Drop FTS5 sync triggers before the bulk delete. Each
 -- DELETE FROM messages otherwise fires messages_ad which
