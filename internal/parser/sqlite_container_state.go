@@ -28,6 +28,15 @@ import (
 //
 // A spurious mismatch merely costs one redundant re-read, while a wrong
 // match is what the write markers rule out.
+//
+// Both headers are read per the documented on-disk format, which SQLite
+// pledges to keep backwards compatible through 2050:
+//
+//	https://www.sqlite.org/fileformat2.html (database header
+//	#the_database_header, WAL format #wal_file_format; layouts
+//	unchanged since 3.0.0 and 3.7.0 respectively)
+//	https://www.sqlite.org/lts.html (long-term support and format
+//	stability pledge through 2050)
 type SQLiteContainerState struct {
 	DBSize          int64
 	DBMtimeSec      int64
@@ -40,14 +49,15 @@ type SQLiteContainerState struct {
 }
 
 // sqliteHeaderProbeSize covers the 100-byte SQLite database header; the
-// file change counter lives at bytes 24-27 (big-endian).
+// file change counter lives at bytes 24-27 (big-endian), per
+// https://www.sqlite.org/fileformat2.html#the_database_header.
 const sqliteHeaderProbeSize = 100
 
 // The documented WAL header magic values (byte order of the frame
 // checksums) and the only WAL format version ever published (stable since
-// SQLite 3.7.0). The salts and checkpoint sequence are only meaningful
-// under this exact format, so anything else fails closed to "never
-// trusted".
+// SQLite 3.7.0), per https://www.sqlite.org/fileformat2.html#wal_file_format.
+// The salts and checkpoint sequence are only meaningful under this exact
+// format, so anything else fails closed to "never trusted".
 const (
 	sqliteWALMagicBE = 0x377f0683
 	sqliteWALMagicLE = 0x377f0682
