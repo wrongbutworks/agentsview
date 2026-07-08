@@ -13,7 +13,7 @@ require (
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/klauspost/compress v1.19.0
-	github.com/mattn/go-runewidth v0.0.23
+	github.com/mattn/go-runewidth v0.0.24
 	github.com/mattn/go-sqlite3 v1.14.47
 	github.com/minio/minio-go/v7 v7.2.1
 	github.com/modelcontextprotocol/go-sdk v1.6.1
@@ -28,8 +28,8 @@ require (
 	go.kenn.io/kit v0.2.1
 	golang.org/x/mod v0.37.0
 	golang.org/x/perf v0.0.0-20260615155930-9e4b9ddef5b6
-	golang.org/x/sync v0.21.0
-	golang.org/x/sys v0.46.0
+	golang.org/x/sync v0.22.0
+	golang.org/x/sys v0.47.0
 	golang.org/x/term v0.44.0
 	modernc.org/sqlite v1.53.0
 )
