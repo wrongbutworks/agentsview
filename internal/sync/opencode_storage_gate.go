@@ -69,25 +69,53 @@ func (e *Engine) openCodeStorageSessionPath(file parser.DiscoveredFile) string {
 	return ""
 }
 
+// storageTrustSnapshot marks a point in a session's invalidation history:
+// the trust epoch and the session's invalidation generation at capture
+// time. A promotion carries the snapshot taken before its parse; if either
+// counter has moved by promotion time, an invalidation landed after the
+// capture and the promotion is discarded rather than resurrecting trust
+// the invalidation just revoked.
+type storageTrustSnapshot struct {
+	epoch uint64
+	gen   uint64
+}
+
+// storageTrustSnapshotFor records the session's current invalidation
+// coordinates. It must be taken before the stat signature is captured:
+// an invalidation arriving after the snapshot then reliably blocks the
+// promotion, even when the change it signals is invisible to the stat
+// signature (a same-size, same-mtime child rewrite).
+func (e *Engine) storageTrustSnapshotFor(path string) storageTrustSnapshot {
+	e.storageTrustMu.Lock()
+	defer e.storageTrustMu.Unlock()
+	return storageTrustSnapshot{
+		epoch: e.storageTrustEpoch,
+		gen:   e.storageTrustGens[path],
+	}
+}
+
 // openCodeStorageSessionGateState captures the session's current stat
-// signature for the gate. It returns ("", false) when the file is not a
-// gateable storage session, this run force-parses, or the signature cannot
-// be captured; such sessions never skip and never promote.
+// signature for the gate, along with the invalidation snapshot that any
+// later promotion of this capture must present. It returns ok=false when
+// the file is not a gateable storage session, this run force-parses, or
+// the signature cannot be captured; such sessions never skip and never
+// promote.
 func (e *Engine) openCodeStorageSessionGateState(
 	file parser.DiscoveredFile,
-) (string, bool) {
+) (string, storageTrustSnapshot, bool) {
 	if e.forceParse || file.ForceParse {
-		return "", false
+		return "", storageTrustSnapshot{}, false
 	}
 	sessionPath := e.openCodeStorageSessionPath(file)
 	if sessionPath == "" {
-		return "", false
+		return "", storageTrustSnapshot{}, false
 	}
+	snap := e.storageTrustSnapshotFor(sessionPath)
 	state, ok := parser.StatOpenCodeStorageSessionState(sessionPath)
 	if !ok {
-		return "", false
+		return "", storageTrustSnapshot{}, false
 	}
-	return state, true
+	return state, snap, true
 }
 
 // openCodeStorageSessionFresh reports whether the session's captured stat
@@ -106,15 +134,24 @@ func (e *Engine) openCodeStorageSessionFresh(path, state string) bool {
 // promoteOpenCodeStorageSession records a stat signature that was captured
 // before a parse whose outcome the archive has since absorbed (results
 // dropped as already stored, or confirmed written). The
-// capture-before-parse ordering makes races safe: a write landing between
-// capture and parse leaves the parsed content newer than the signature, so
-// the next capture mismatches and re-verifies.
-func (e *Engine) promoteOpenCodeStorageSession(path, state string) {
+// capture-before-parse ordering makes overlapping writes safe: a write
+// landing between capture and parse leaves the parsed content newer than
+// the signature, so the next capture mismatches and re-verifies. The
+// snapshot check covers the writes that ordering cannot: an invalidation
+// landing between capture and promotion (a watcher event classified while
+// a full sync was mid-pass) bumps the session's generation, so the stale
+// promotion is dropped and the next pass re-verifies by content.
+func (e *Engine) promoteOpenCodeStorageSession(
+	path, state string, snap storageTrustSnapshot,
+) {
 	if path == "" || state == "" {
 		return
 	}
 	e.storageTrustMu.Lock()
 	defer e.storageTrustMu.Unlock()
+	if snap.epoch != e.storageTrustEpoch || snap.gen != e.storageTrustGens[path] {
+		return
+	}
 	if e.trustedStorageSessions == nil {
 		e.trustedStorageSessions = make(map[string]string)
 	}
@@ -132,6 +169,7 @@ func (e *Engine) promoteOpenCodeStorageSession(path, state string) {
 func (e *Engine) stageOpenCodeStorageTrust(
 	res *processResult,
 	path, state string,
+	snap storageTrustSnapshot,
 	parsedCount int,
 	resultSetComplete bool,
 ) {
@@ -140,13 +178,14 @@ func (e *Engine) stageOpenCodeStorageTrust(
 		len(res.excludedSessionIDs) == 0 &&
 		res.retrySessionIDs == nil
 	if clean && len(res.results) == 0 {
-		e.promoteOpenCodeStorageSession(path, state)
+		e.promoteOpenCodeStorageSession(path, state, snap)
 		return
 	}
-	e.invalidateOpenCodeStorageSession(path)
+	e.dropOpenCodeStorageTrust(path)
 	if clean {
 		res.storageTrustPath = path
 		res.storageTrustState = state
+		res.storageTrustSnap = snap
 	}
 }
 
@@ -165,17 +204,16 @@ func (e *Engine) promoteOpenCodeStorageTrustAfterWrite(
 	}
 	for _, pw := range batch {
 		e.promoteOpenCodeStorageSession(
-			pw.storageTrustPath, pw.storageTrustState,
+			pw.storageTrustPath, pw.storageTrustState, pw.storageTrustSnap,
 		)
 	}
 }
 
-// invalidateOpenCodeStorageSession drops trust for one session. Called when
-// a pass parses it to a different outcome and, critically, when a watcher
-// changed-path event resolves to it: the event says something changed even
-// if the stat signature cannot see it, so the next pass must re-verify by
-// content.
-func (e *Engine) invalidateOpenCodeStorageSession(path string) {
+// dropOpenCodeStorageTrust removes the session's trusted signature without
+// bumping its invalidation generation. Used by the pass that owns the
+// session's staged promotion (results in flight to the write batch, or an
+// unclean parse), so the drop does not veto that same pass's promotion.
+func (e *Engine) dropOpenCodeStorageTrust(path string) {
 	if path == "" {
 		return
 	}
@@ -184,11 +222,35 @@ func (e *Engine) invalidateOpenCodeStorageSession(path string) {
 	delete(e.trustedStorageSessions, path)
 }
 
-// clearTrustedOpenCodeStorageSessions drops every trusted session state.
-// Called by resync, which rebuilds the archive from scratch and must
-// re-verify every session against it.
+// invalidateOpenCodeStorageSession drops trust for one session and bumps
+// its invalidation generation. Called when a watcher changed-path event
+// resolves to the session: the event says something changed even if the
+// stat signature cannot see it, so the next pass must re-verify by
+// content. The generation bump extends that guarantee across a
+// concurrently running pass — a promotion captured before the event
+// presents a stale snapshot and is discarded, so it cannot restore the
+// trust this invalidation revoked.
+func (e *Engine) invalidateOpenCodeStorageSession(path string) {
+	if path == "" {
+		return
+	}
+	e.storageTrustMu.Lock()
+	defer e.storageTrustMu.Unlock()
+	delete(e.trustedStorageSessions, path)
+	if e.storageTrustGens == nil {
+		e.storageTrustGens = make(map[string]uint64)
+	}
+	e.storageTrustGens[path]++
+}
+
+// clearTrustedOpenCodeStorageSessions drops every trusted session state
+// and starts a new trust epoch, so promotions staged before the clear are
+// discarded. Called by resync, which rebuilds the archive from scratch and
+// must re-verify every session against it.
 func (e *Engine) clearTrustedOpenCodeStorageSessions() {
 	e.storageTrustMu.Lock()
 	defer e.storageTrustMu.Unlock()
 	e.trustedStorageSessions = nil
+	e.storageTrustGens = nil
+	e.storageTrustEpoch++
 }

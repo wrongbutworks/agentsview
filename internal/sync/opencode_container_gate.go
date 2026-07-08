@@ -110,14 +110,22 @@ func (e *Engine) captureSQLiteContainerStates() map[string]parser.SQLiteContaine
 // sessions from processing keeps the container untrusted. A discovered
 // container with no pre-discovery capture is marked failed and can neither
 // gate-skip nor be promoted this pass.
+//
+// It runs AFTER discovery, so each captured container is re-stat'ed here
+// and compared against its pre-discovery capture. A mismatch means the
+// container changed inside the capture-discovery window: the discovered
+// session set may already include that change, so gating against the
+// pre-discovery state would skip it while it still matches the trusted
+// state. Such containers are failed for the pass — no skips, no promotion
+// — and the next pass re-verifies them by content.
 func (e *Engine) beginSQLiteContainerPass(
 	files []parser.DiscoveredFile,
 	preStates map[string]parser.SQLiteContainerState,
 ) {
-	e.containerMu.Lock()
-	defer e.containerMu.Unlock()
-	e.containerPass = nil
 	if e.forceParse {
+		e.containerMu.Lock()
+		e.containerPass = nil
+		e.containerMu.Unlock()
 		return
 	}
 	var pass *sqliteContainerPass
@@ -144,7 +152,19 @@ func (e *Engine) beginSQLiteContainerPass(
 			pass.failed[dbPath] = true
 		}
 	}
+	if pass != nil {
+		for dbPath, pre := range pass.captured {
+			if post, ok := parser.StatSQLiteContainerState(dbPath); ok &&
+				post == pre {
+				continue
+			}
+			delete(pass.captured, dbPath)
+			pass.failed[dbPath] = true
+		}
+	}
+	e.containerMu.Lock()
 	e.containerPass = pass
+	e.containerMu.Unlock()
 }
 
 // sqliteContainerSourceFresh reports whether a discovered file belongs to a

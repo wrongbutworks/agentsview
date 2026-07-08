@@ -161,14 +161,20 @@ type Engine struct {
 	trustedSQLiteContainers map[string]parser.SQLiteContainerState
 	containerPass           *sqliteContainerPass
 
-	// storageTrustMu guards trustedStorageSessions, the per-session
-	// freshness gate for OpenCode-family file-backed storage sessions
-	// (see opencode_storage_gate.go). It maps a session JSON path to the
-	// stat signature captured before the last parse whose outcome the
-	// archive absorbed (results dropped as already stored, or confirmed
-	// written). In-memory only: a restart re-verifies once.
+	// storageTrustMu guards the per-session freshness gate for
+	// OpenCode-family file-backed storage sessions (see
+	// opencode_storage_gate.go). trustedStorageSessions maps a session
+	// JSON path to the stat signature captured before the last parse
+	// whose outcome the archive absorbed (results dropped as already
+	// stored, or confirmed written). storageTrustGens counts each
+	// session's invalidations and storageTrustEpoch counts full clears,
+	// so a promotion whose pre-parse snapshot predates an invalidation
+	// is discarded instead of resurrecting the invalidated trust. All
+	// in-memory only: a restart re-verifies once.
 	storageTrustMu         gosync.Mutex
 	trustedStorageSessions map[string]string
+	storageTrustGens       map[string]uint64
+	storageTrustEpoch      uint64
 }
 
 // PhaseStats returns the engine's phase counter. The values reflect only
@@ -3502,6 +3508,7 @@ func (e *Engine) collectAndBatch(
 					forceReplace:      r.forceReplace,
 					storageTrustPath:  r.storageTrustPath,
 					storageTrustState: r.storageTrustState,
+					storageTrustSnap:  r.storageTrustSnap,
 				})
 			}
 			// A Kiro SQLite store is discovered as one container source
@@ -3655,12 +3662,14 @@ type processResult struct {
 	// suppressPresenceSweep marks an incomplete source result where
 	// missing stored sessions are expected rather than parser drift.
 	suppressPresenceSweep bool
-	// storageTrustPath/State carry an OpenCode-family storage session's
-	// pre-parse stat signature to the write path, which promotes it once
-	// the session's batch is confirmed fully written (see
-	// opencode_storage_gate.go). Empty for everything else.
+	// storageTrustPath/State/Snap carry an OpenCode-family storage
+	// session's pre-parse stat signature and invalidation snapshot to
+	// the write path, which promotes it once the session's batch is
+	// confirmed fully written (see opencode_storage_gate.go). Empty for
+	// everything else.
 	storageTrustPath  string
 	storageTrustState string
+	storageTrustSnap  storageTrustSnapshot
 }
 
 func (r processResult) needsRetryForSession(sessionID string) bool {
@@ -3830,7 +3839,8 @@ func (e *Engine) processProviderFile(
 	// inputs are unchanged, so skip before re-reading the whole message
 	// and part tree (see opencode_storage_gate.go). The captured state
 	// also feeds the post-parse promotion below.
-	storageState, storageStateOK := e.openCodeStorageSessionGateState(file)
+	storageState, storageSnap, storageStateOK :=
+		e.openCodeStorageSessionGateState(file)
 	if storageStateOK &&
 		e.openCodeStorageSessionFresh(file.Path, storageState) {
 		return processResult{skip: true}, true
@@ -4097,7 +4107,7 @@ func (e *Engine) processProviderFile(
 	e.applyProviderFilePathPolicies(provider, file.Agent, &res)
 	if storageStateOK {
 		e.stageOpenCodeStorageTrust(
-			&res, file.Path, storageState,
+			&res, file.Path, storageState, storageSnap,
 			parsedCount, outcome.ResultSetComplete,
 		)
 	}
@@ -5837,11 +5847,12 @@ type pendingWrite struct {
 	usageEvents  []parser.ParsedUsageEvent
 	needsRetry   bool
 	forceReplace bool
-	// storageTrustPath/State promote the session's OpenCode storage-gate
-	// trust after its batch is confirmed fully written. Empty for
-	// everything else.
+	// storageTrustPath/State/Snap promote the session's OpenCode
+	// storage-gate trust after its batch is confirmed fully written.
+	// Empty for everything else.
 	storageTrustPath  string
 	storageTrustState string
+	storageTrustSnap  storageTrustSnapshot
 }
 
 func dataVersionForWrite(pw pendingWrite) int {

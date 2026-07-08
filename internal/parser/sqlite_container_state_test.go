@@ -74,9 +74,15 @@ func TestSQLiteContainerStateDetectsFileReplacement(t *testing.T) {
 	require.NoError(t, err, "read container bytes")
 	info, err := os.Stat(dbPath)
 	require.NoError(t, err, "stat container")
-	require.NoError(t, os.Remove(dbPath), "remove container")
-	require.NoError(t, os.WriteFile(dbPath, raw, 0o644),
-		"recreate container with identical bytes")
+	// Write the copy while the original still exists so the two files are
+	// guaranteed distinct inodes, then rename over the original. A
+	// remove-then-recreate at the same path can reuse the freed inode and
+	// make the replacement genuinely indistinguishable.
+	replacement := dbPath + ".replacement"
+	require.NoError(t, os.WriteFile(replacement, raw, 0o644),
+		"write replacement container with identical bytes")
+	require.NoError(t, os.Rename(replacement, dbPath),
+		"swap replacement over container")
 	require.NoError(t,
 		os.Chtimes(dbPath, info.ModTime(), info.ModTime()),
 		"restore container mtime")
