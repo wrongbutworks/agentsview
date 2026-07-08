@@ -469,10 +469,13 @@ func (s openCodeFormatSourceSet) Fingerprint(
 		return SourceFingerprint{}, fmt.Errorf("stat %s: source is a directory", path)
 	}
 	fingerprint.Size = info.Size()
-	fingerprint.Hash, err = openCodeProviderStorageFingerprint(path)
-	if err != nil {
-		return SourceFingerprint{}, err
-	}
+	// No content hash: no engine freshness gate consumes it for this
+	// family (see providerFingerprintHashRequiredForFreshness), and the
+	// authoritative storage fingerprint is computed by Parse and compared
+	// post-parse by dropUnchangedSharedSQLiteResults. Computing it here
+	// re-read and re-hashed every message and part file of the session on
+	// every fingerprint call — the dominant cost of syncing streaming
+	// storage sessions — for a value nothing read.
 	return fingerprint, nil
 }
 
@@ -795,47 +798,6 @@ func (s openCodeFormatSourceSet) isStorageSessionPath(
 		parts[1] == filepath.Base(src.SessionRoot) &&
 		strings.HasSuffix(parts[3], ".json") &&
 		(!requireExisting || IsRegularFile(path))
-}
-
-func openCodeProviderStorageFingerprint(sessionPath string) (string, error) {
-	raw, err := os.ReadFile(sessionPath)
-	if err != nil {
-		return "", err
-	}
-	var sf openCodeStorageSessionFile
-	if err := json.Unmarshal(raw, &sf); err != nil {
-		return "", fmt.Errorf(
-			"decoding opencode session file %s: %w",
-			sessionPath, err,
-		)
-	}
-	if sf.ID == "" {
-		return "", fmt.Errorf(
-			"opencode session file %s missing id",
-			sessionPath,
-		)
-	}
-	root := filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(sessionPath))))
-	msgs, err := loadOpenCodeStorageMessages(root, sf.ID)
-	if err != nil {
-		return "", err
-	}
-	parts, err := loadOpenCodeStorageParts(root, msgs)
-	if err != nil {
-		return "", err
-	}
-	return buildOpenCodeSessionFingerprint(
-		openCodeSessionRow{
-			id:          sf.ID,
-			parentID:    sf.ParentID,
-			title:       sf.Title,
-			timeCreated: sf.Time.Created,
-			timeUpdated: sf.Time.Updated,
-		},
-		sf.Directory,
-		msgs,
-		parts,
-	), nil
 }
 
 func readOpenCodeProviderStorageSessionID(path string) string {

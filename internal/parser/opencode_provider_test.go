@@ -80,7 +80,10 @@ func TestOpenCodeProviderStorageSourceMethods(t *testing.T) {
 	assert.Equal(t, sessionPath, fingerprint.Key)
 	assert.Positive(t, fingerprint.Size)
 	assert.Positive(t, fingerprint.MTimeNS)
-	assert.True(t, HasOpenCodeStorageFingerprint(fingerprint.Hash))
+	// Storage-mode Fingerprint is stat-only: the content fingerprint is
+	// computed by Parse, and hashing here would re-read every message and
+	// part file on each fingerprint call.
+	assert.Empty(t, fingerprint.Hash)
 
 	outcome, err := provider.Parse(context.Background(), ParseRequest{
 		Source:      found,
@@ -95,7 +98,9 @@ func TestOpenCodeProviderStorageSourceMethods(t *testing.T) {
 	assert.Equal(t, AgentOpenCode, result.Result.Session.Agent)
 	assert.Equal(t, "opencode_app", result.Result.Session.Project)
 	assert.Equal(t, "devbox", result.Result.Session.Machine)
-	assert.Equal(t, fingerprint.Hash, result.Result.Session.File.Hash)
+	assert.True(t,
+		HasOpenCodeStorageFingerprint(result.Result.Session.File.Hash),
+		"Parse must compute the storage content fingerprint itself")
 	assert.Len(t, result.Result.Messages, 1)
 
 	require.NoError(t, os.Remove(sessionPath), "remove storage session")

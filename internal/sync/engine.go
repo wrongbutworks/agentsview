@@ -160,6 +160,15 @@ type Engine struct {
 	containerMu             gosync.Mutex
 	trustedSQLiteContainers map[string]parser.SQLiteContainerState
 	containerPass           *sqliteContainerPass
+
+	// storageTrustMu guards trustedStorageSessions, the per-session
+	// freshness gate for OpenCode-family file-backed storage sessions
+	// (see opencode_storage_gate.go). It maps a session JSON path to the
+	// stat signature captured before the last pass that verified every
+	// parsed result as already stored. In-memory only: a restart
+	// re-verifies once.
+	storageTrustMu         gosync.Mutex
+	trustedStorageSessions map[string]string
 }
 
 // PhaseStats returns the engine's phase counter. The values reflect only
@@ -701,15 +710,19 @@ func (e *Engine) classifyProviderChangedPath(
 			continue
 		}
 		for _, watchRoot := range watchRoots {
-			storedSourcePaths, err := e.db.ListStoredSourcePathHints(
-				string(def.Type),
-				[]string{watchRoot},
-			)
-			if err != nil {
-				log.Printf(
-					"%s provider changed-path stored hints: %v",
-					def.Type, err,
+			var storedSourcePaths []string
+			if providerChangedPathWantsStoredHints(def.Type) {
+				var err error
+				storedSourcePaths, err = e.db.ListStoredSourcePathHints(
+					string(def.Type),
+					[]string{watchRoot},
 				)
+				if err != nil {
+					log.Printf(
+						"%s provider changed-path stored hints: %v",
+						def.Type, err,
+					)
+				}
 			}
 			sources, err := provider.SourcesForChangedPath(
 				ctx,
@@ -750,14 +763,22 @@ func (e *Engine) classifyProviderChangedPath(
 				}
 				seen[key] = struct{}{}
 				sourceCopy := source
-				files = append(files, parser.DiscoveredFile{
+				discovered := parser.DiscoveredFile{
 					Path:            sourcePath,
 					Project:         source.ProjectHint,
 					Agent:           agent,
 					ForceParse:      providerChangedPathForceParse(agent, sourcePath, path, eventKind, mode),
 					ProviderSource:  &sourceCopy,
 					ProviderProcess: mode == parser.ProviderMigrationProviderAuthoritative,
-				})
+				}
+				// A watcher event names a concrete change even when the
+				// session's stat signature cannot see it (a same-size,
+				// same-mtime child rewrite), so the storage gate must
+				// re-verify this session by content on the next pass.
+				if sessionPath := e.openCodeStorageSessionPath(discovered); sessionPath != "" {
+					e.invalidateOpenCodeStorageSession(sessionPath)
+				}
+				files = append(files, discovered)
 			}
 		}
 	}
@@ -815,10 +836,34 @@ func providerChangedPathForceParse(
 	}
 	if filepath.Clean(sourcePath) != filepath.Clean(eventPath) &&
 		!providerVirtualSourceBackedByEvent(sourcePath, eventPath) {
+		// OpenCode-family storage sessions resolve message/part events
+		// to their session JSON, whose fingerprint and stat signature
+		// span those same child files, and the classifier invalidates
+		// the session's storage-gate trust for every event. The normal
+		// freshness path therefore re-verifies by content, while a
+		// forced parse would bypass dropUnchangedSharedSQLiteResults
+		// and rewrite the whole session on every streamed append.
+		// Remove events keep the force so a deleted child still
+		// re-emits through the deletion path.
+		if eventKind != "remove" &&
+			isOpenCodeFormatStorageAgent(agent) &&
+			isOpenCodeFormatStoragePath(agent, sourcePath) {
+			return false
+		}
 		return true
 	}
 	return eventKind == "remove" &&
 		providerDeletedPhysicalSQLiteSource(agent, sourcePath)
+}
+
+// providerChangedPathWantsStoredHints reports whether an agent's
+// SourcesForChangedPath implementation reads
+// ChangedPathRequest.StoredSourcePaths. The OpenCode-family source sets
+// resolve changed paths purely from the on-disk layout, so the per-event
+// stored-hints lookup — a LIKE scan over every stored session row of the
+// agent — would be computed and discarded on every watcher event.
+func providerChangedPathWantsStoredHints(agent parser.AgentType) bool {
+	return !isOpenCodeFormatStorageAgent(agent)
 }
 
 func providerVirtualSourceBackedByEvent(sourcePath, eventPath string) bool {
@@ -1153,8 +1198,10 @@ func (e *Engine) resyncAllLocked(
 	}
 
 	// Resync rebuilds the archive from scratch, so every shared-SQLite
-	// container must be re-verified against the fresh database.
+	// container and storage session must be re-verified against the
+	// fresh database.
 	e.clearTrustedSQLiteContainers()
+	e.clearTrustedOpenCodeStorageSessions()
 
 	origDB := e.db
 	origPath := origDB.Path()
@@ -3750,6 +3797,17 @@ func (e *Engine) processProviderFile(
 		return processResult{skip: true}, true
 	}
 
+	// OpenCode-family file-backed storage gate: when the session's
+	// per-file stat signature matches the last verified pass, its parse
+	// inputs are unchanged, so skip before re-reading the whole message
+	// and part tree (see opencode_storage_gate.go). The captured state
+	// also feeds the post-parse promotion below.
+	storageState, storageStateOK := e.openCodeStorageSessionGateState(file)
+	if storageStateOK &&
+		e.openCodeStorageSessionFresh(file.Path, storageState) {
+		return processResult{skip: true}, true
+	}
+
 	factory, ok := e.providerFactories[file.Agent]
 	if !ok {
 		return processResult{
@@ -3973,8 +4031,10 @@ func (e *Engine) processProviderFile(
 		}, true
 	}
 
+	parsedResults := parseOutcomeResults(outcome.Results)
+	parsedCount := len(parsedResults)
 	res := processResult{
-		results:               e.dropUnchangedSharedSQLiteResults(file, parseOutcomeResults(outcome.Results)),
+		results:               e.dropUnchangedSharedSQLiteResults(file, parsedResults),
 		excludedSessionIDs:    append([]string(nil), outcome.ExcludedSessionIDs...),
 		mtime:                 fingerprint.MTimeNS,
 		cacheSkip:             cacheSkip,
@@ -4004,6 +4064,22 @@ func (e *Engine) processProviderFile(
 				virtualPath: sourceErr.SourceKey,
 				err:         sourceErr.Err,
 			})
+		}
+	}
+	if storageStateOK {
+		// Promote only a pass that verified the session end to end: a
+		// complete result set whose every parsed result was dropped as
+		// already stored, with no exclusions or deferred retries.
+		// Anything else — changed content, retries, exclusions — must
+		// re-verify next pass.
+		if outcome.ResultSetComplete &&
+			parsedCount > 0 &&
+			len(res.results) == 0 &&
+			len(res.excludedSessionIDs) == 0 &&
+			res.retrySessionIDs == nil {
+			e.promoteOpenCodeStorageSession(file.Path, storageState)
+		} else {
+			e.invalidateOpenCodeStorageSession(file.Path)
 		}
 	}
 	e.applyProviderFilePathPolicies(provider, file.Agent, &res)

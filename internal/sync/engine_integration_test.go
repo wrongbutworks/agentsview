@@ -728,6 +728,220 @@ func TestSyncEngineOpenCodeSQLiteCutoffPassMustNotTrustContainer(
 	)
 }
 
+// TestSyncEngineOpenCodeStorageUntouchedSessionSkipsReparse pins the
+// per-session freshness gate for file-backed storage sessions: once a full
+// sync has verified a session as already stored, an untouched session must
+// skip before fingerprinting and parsing. The part file is made unreadable
+// for the gated pass, so any attempt to re-read the tree would surface as a
+// failure instead of a skip.
+func TestSyncEngineOpenCodeStorageUntouchedSessionSkipsReparse(
+	t *testing.T,
+) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	storage := createOpenCodeStorageFixture(t, env.opencodeDir)
+	const sessionID = "oc-storage-gated"
+	storage.addSession(
+		t, "global", sessionID,
+		"/home/user/code/oc-app", "Storage Gated",
+		1704067200000, 1704067205000,
+	)
+	storage.addMessage(
+		t, sessionID, "msg-a1", "assistant",
+		1704067201000, nil,
+	)
+	partPath := storage.addTextPart(
+		t, sessionID, "msg-a1", "part-a1",
+		"gated storage reply", 1704067201000,
+	)
+
+	stats := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "first sync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced, "first sync writes the session")
+
+	// The pass after a write re-parses once, verifies every result as
+	// already stored (dropped without a skip tally), and only then trusts
+	// the session's stat signature.
+	stats = env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "second sync aborted: %+v", stats)
+	assert.Equal(t, 0, stats.Synced,
+		"untouched session must not be re-emitted")
+
+	require.NoError(t, os.Chmod(partPath, 0o000), "make part unreadable")
+	t.Cleanup(func() {
+		_ = os.Chmod(partPath, 0o644)
+	})
+
+	stats = env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "gated sync aborted: %+v", stats)
+	assert.Equal(t, 0, stats.Failed,
+		"gated pass must not re-read message or part files")
+	assert.Equal(t, 1, stats.Skipped,
+		"verified-unchanged session must skip before parse")
+	assertMessageContent(
+		t, env.db, "opencode:"+sessionID, "gated storage reply",
+	)
+}
+
+// TestSyncEngineOpenCodeStorageAppendedMessageReemitsSession covers the
+// streaming case through the gate: a new message/part appended after the
+// session was trusted changes its stat signature, so the session re-parses
+// and re-emits exactly once, then settles back to skipping.
+func TestSyncEngineOpenCodeStorageAppendedMessageReemitsSession(
+	t *testing.T,
+) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	storage := createOpenCodeStorageFixture(t, env.opencodeDir)
+	const sessionID = "oc-storage-append"
+	storage.addSession(
+		t, "global", sessionID,
+		"/home/user/code/oc-app", "Storage Append",
+		1704067200000, 1704067205000,
+	)
+	storage.addMessage(
+		t, sessionID, "msg-a1", "assistant",
+		1704067201000, nil,
+	)
+	storage.addTextPart(
+		t, sessionID, "msg-a1", "part-a1",
+		"first storage reply", 1704067201000,
+	)
+
+	stats := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "first sync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced, "first sync writes the session")
+	stats = env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "second sync aborted: %+v", stats)
+	assert.Equal(t, 0, stats.Synced, "verification pass drops the unchanged session")
+
+	storage.addMessage(
+		t, sessionID, "msg-b1", "assistant",
+		1704067202000, nil,
+	)
+	storage.addTextPart(
+		t, sessionID, "msg-b1", "part-b1",
+		"second storage reply", 1704067202000,
+	)
+
+	stats = env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "append sync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced,
+		"appended message must re-emit the session")
+	assertMessageContent(
+		t, env.db, "opencode:"+sessionID,
+		"first storage reply", "second storage reply",
+	)
+}
+
+// TestSyncEngineOpenCodeStorageWatcherEventDoesNotRewriteUnchanged pins the
+// watcher path for file-backed storage sessions: a changed-path event that
+// resolves to a session whose parse output is already stored must not
+// rewrite it. Message/part events used to force-parse, which bypassed
+// dropUnchangedSharedSQLiteResults and rewrote the whole session (bumping
+// local_modified_at and amplifying remote pushes) on every streamed append
+// or spurious event re-fire.
+func TestSyncEngineOpenCodeStorageWatcherEventDoesNotRewriteUnchanged(
+	t *testing.T,
+) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	storage := createOpenCodeStorageFixture(t, env.opencodeDir)
+	const sessionID = "oc-storage-watch-unchanged"
+	storage.addSession(
+		t, "global", sessionID,
+		"/home/user/code/oc-app", "Storage Watch",
+		1704067200000, 1704067205000,
+	)
+	storage.addMessage(
+		t, sessionID, "msg-a1", "assistant",
+		1704067201000, nil,
+	)
+	partPath := storage.addTextPart(
+		t, sessionID, "msg-a1", "part-a1",
+		"steady storage reply", 1704067201000,
+	)
+
+	stats := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "first sync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced, "first sync writes the session")
+	fullID := "opencode:" + sessionID
+	before := openCodeLocalModifiedSnapshot(t, env.db, fullID)
+
+	env.engine.SyncPaths([]string{partPath})
+
+	after := openCodeLocalModifiedSnapshot(t, env.db, fullID)
+	assert.Equal(t, before[fullID], after[fullID],
+		"an event on an unchanged session must not rewrite it")
+	assertMessageContent(
+		t, env.db, fullID, "steady storage reply",
+	)
+
+	storage.addTextPart(
+		t, sessionID, "msg-a1", "part-a1",
+		"updated storage reply", 1704067203000,
+	)
+	env.engine.SyncPaths([]string{partPath})
+
+	assertMessageContent(
+		t, env.db, fullID, "updated storage reply",
+	)
+	final := openCodeLocalModifiedSnapshot(t, env.db, fullID)
+	assert.NotEqual(t, after[fullID], final[fullID],
+		"a real content change must rewrite the session")
+}
+
+// TestSyncEngineOpenCodeStorageStatIdenticalEventStillReemits pins the
+// gate's safety boundary on the watcher path: a child rewritten in place
+// with the same size and a restored mtime is invisible to the stat
+// signature, but the event names the change, so classification must
+// invalidate the session's trust and the next parse must re-emit the new
+// content.
+func TestSyncEngineOpenCodeStorageStatIdenticalEventStillReemits(
+	t *testing.T,
+) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	storage := createOpenCodeStorageFixture(t, env.opencodeDir)
+	const sessionID = "oc-storage-stat-twin"
+	storage.addSession(
+		t, "global", sessionID,
+		"/home/user/code/oc-app", "Storage Stat Twin",
+		1704067200000, 1704067205000,
+	)
+	storage.addMessage(
+		t, sessionID, "msg-a1", "assistant",
+		1704067201000, nil,
+	)
+	partPath := storage.addTextPart(
+		t, sessionID, "msg-a1", "part-a1",
+		"stat twin reply AAAA", 1704067201000,
+	)
+
+	stats := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "first sync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced, "first sync writes the session")
+	stats = env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "second sync aborted: %+v", stats)
+	assert.Equal(t, 0, stats.Synced, "verification pass drops the unchanged session")
+
+	beforeInfo, err := os.Stat(partPath)
+	require.NoError(t, err, "stat part before rewrite")
+	// Same-length replacement text keeps the part file size stable, and the
+	// mtime is restored below, so only the event says anything changed.
+	storage.addTextPart(
+		t, sessionID, "msg-a1", "part-a1",
+		"stat twin reply BBBB", 1704067201000,
+	)
+	afterInfo, err := os.Stat(partPath)
+	require.NoError(t, err, "stat part after rewrite")
+	require.Equal(t, beforeInfo.Size(), afterInfo.Size(),
+		"fixture must keep the part size stable for this test")
+	setFileMtime(t, partPath, beforeInfo.ModTime().UnixNano())
+
+	env.engine.SyncPaths([]string{partPath})
+
+	assertMessageContent(
+		t, env.db, "opencode:"+sessionID, "stat twin reply BBBB",
+	)
+}
+
 func TestSyncEngineOpenCodeSQLiteSameMtimeMetadataChangeUsesFingerprint(
 	t *testing.T,
 ) {
